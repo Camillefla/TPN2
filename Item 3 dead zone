@@ -1,0 +1,197 @@
+clc; clear all; close all;
+%--------------------------------------------------------------------------
+% 1. Definición de parámetros físicos del sistema grúa
+m  = 0.1;        % masa de la carga ligera (kg)
+F  = 0.1;        % fricción (N·s/m)
+l  = 1.6;        % longitud del cable (m)
+g  = 9.8;        % gravedad (m/s^2)
+M  = 1.5;        % masa del carro (kg)
+m2 = m*10;       % masa de la carga pesada (10 veces la ligera)
+
+%--------------------------------------------------------------------------
+% 2. Definición de matrices de estado para ambos escenarios
+% A: cuando la grúa se va (sin carga pesada)
+A = [0 1 0 0;                             
+     0 -F/M -m*g/M 0;
+     0 0 0 1;
+     0 -F/(l*M) -g*(m+M)/(l*M) 0];
+eig(A) % Verificar estabilidad
+
+% A2: cuando la grúa regresa (con carga pesada)
+A2 = [0 1 0 0;
+      0 -F/M -m2*g/M 0;
+      0 0 0 1;
+      0 -F/(l*M) -g*(m2+M)/(l*M) 0];
+
+% Matriz de entrada
+B = [0; 1/M; 0; 1/(l*M)];
+
+% Matriz de salida (posición y ángulo)
+C = [1 0 0 0;    % delta
+     0 0 1 0];   % phi
+
+%--------------------------------------------------------------------------
+% 3. Parámetros de simulación
+h = 1e-2;        % Paso de integración (s)
+TT = 15;         % Tiempo total de simulación (s)
+
+%--------------------------------------------------------------------------
+% 4. Función de zona muerta (deadzone)
+function y = deadzone(u, d)
+    y = zeros(size(u));
+    y(u > d)  = u(u > d)  - d;
+    y(u < -d) = u(u < -d) + d;
+    % y queda en 0 si -d <= u <= d
+end
+
+%--------------------------------------------------------------------------
+% 5. Comprobación de controlabilidad
+M1 = [B A*B A^2*B A^3*B];
+M2 = [B A2*B A2^2*B A2^3*B];
+rank(M1) % debe ser 4
+rank(M2) % debe ser 4
+
+%--------------------------------------------------------------------------
+% 6. Ampliación de matrices para control integral
+Aa  = [A, zeros(4,1); -C(1,:), eye(1)];
+Ba  = [B; 0];
+Aa2 = [A2, zeros(4,1); -C(1,:), eye(1)];
+
+%--------------------------------------------------------------------------
+% 7. Diseño del controlador LQR (sin carga)
+Q = diag([100000 100 100000000 1 1]); % Posicion-velocidad-angulo-omega-error 
+R = 800;                    % Peso para la acción de control
+[KLQR, S, P] = lqr(Aa, Ba, Q, R);
+K  = KLQR(1:4);
+Ki = -KLQR(5);
+
+% 8. Diseño del controlador LQR (con carga)
+Q2 = diag([1000 1000 5000000 100 1]);
+R2 = 1000;
+[KLQR2, S, P2] = lqr(Aa2, Ba, Q2, R2);
+K2  = KLQR2(1:4);
+Ki2 = -KLQR2(5);
+
+%--------------------------------------------------------------------------
+% 9. Diseño del observador (sistema dual)
+Ao = A';
+Bo = C';
+Co = B';
+
+Qo = diag([1 1 100 1]);
+Ro = diag([500 500]);
+
+Ko = lqr(Ao, Bo, Qo, Ro)';
+
+Ao2 = A2';
+Qo2 = diag([1e4 1 1e4 1]);
+Ro2 = diag([500 500]);
+Ko2 = lqr(Ao2, Bo, Qo2, Ro2)';
+
+%--------------------------------------------------------------------------
+% 10. Simulación para diferentes zonas muertas
+np = TT/h;
+deadzone_list = [0, 0.2, 0.5, 0.8, 1.2]; % valores de zona muerta a probar (V)
+couleurs = ['g' 'r' 'b' 'y' 'k' 'm'];    % colores para graficar
+
+t = 0:h:TT;
+
+for k = 1:length(deadzone_list)
+    % Inicialización de variables para cada zona muerta
+    u = zeros(1, np+1);
+    u_applique = zeros(1, np+1);
+    delta_p = zeros(1, np+1);
+    delta = zeros(1, np+1);
+    phi_p = zeros(1, np+1);
+    phi = zeros(1, np+1);
+
+    epsilon = 0;
+    delta(1) = 0;
+    delta_p(1) = 0;
+    phi(1) = pi;      % ángulo inicial (equilibrio estable)
+    phi_p(1) = 0;
+
+    x = [delta(1) delta_p(1) phi(1) phi_p(1)]';
+    xop = [0 0 pi 0]';
+    x_obs = [0 0 pi 0]';
+
+    ref_hist = 10*ones(1, np+1);
+    ref = 10;
+    angulo_ref = pi*ones(1, np+1);
+
+    for i = 1:np
+        % Ley de control con observador
+        y = C*x;
+        y_obs = C*(x_obs + xop);
+
+        epsilon_p = ref - y(1);      % error de posición
+        epsilon   = epsilon + epsilon_p*h; % integración del error
+
+        % u(i) = -K*(x - xop) + Ki*epsilon;   % Sin observador
+        u(i) = -K*(x_obs - xop) + Ki*epsilon; % Con observador
+        
+        % Aplicación de zona muerta
+        u_applique(i) = deadzone(u(i), deadzone_list(k));
+
+        % Dinámica no lineal del sistema (modelo físico)
+        delta_p_next = (1/(M+m)) * (u_applique(i) - m*l*phi_p(i)*cos(phi(i)) + m*l*phi_p(i)^2*sin(phi(i)) - F*delta_p(i));
+        phi_p_next   = (1/l) * (g*sin(phi(i)) - delta_p_next*cos(phi(i)));
+
+        % Integración Euler para actualizar estados
+        delta_p(i+1) = delta_p(i) + delta_p_next*h;
+        delta(i+1)   = delta(i) + delta_p(i)*h;
+        phi_p(i+1)   = phi_p(i) + phi_p_next*h;
+        phi(i+1)     = phi(i) + phi_p(i)*h;
+
+        % Cambio de controlador y parámetros cuando la grúa regresa con carga
+        if delta(i+1) >= 10
+            K = K2;
+            Ki = Ki2;
+            Ko = Ko2;
+            A = A2;
+            m = m2;
+            ref = 0;
+        end
+
+        if ref == 0
+            ref_hist(i+1) = ref;
+        end
+
+        % Actualización del estado real
+        x = [delta(i+1) delta_p(i+1) phi(i+1) phi_p(i+1)]';
+
+        % Observador de estado
+        x_obs_p = A*(x_obs-xop) + B*u_applique(i) + Ko*(y - y_obs);
+        x_obs   = x_obs + h*x_obs_p;
+    end
+
+    %--------------------------------------------------------------------------
+    % 11. Graficación de resultados para cada zona muerta
+    figure(1);
+
+    % Posición del carro
+    subplot(3,2,1); grid on; hold on;
+    plot(t, delta, couleurs(k), 'DisplayName', ['deadzone = ' num2str(deadzone_list(k)) ' V']);
+    title('Posición grúa'); legend('show'); xlabel('Tiempo');
+
+    % Velocidad del carro
+    subplot(3,2,3); grid on; hold on;
+    plot(t, delta_p, couleurs(k)); title('Veloc de la grúa'); xlabel('Tiempo');
+
+    % Acción de control aplicada
+    subplot(3,2,5); grid on; hold on;
+    plot(t, u, couleurs(k)); title('Acción de control'); xlabel('Tiempo [Seg]');
+
+    % Ángulo del péndulo
+    subplot(3,2,2); grid on; hold on;
+    plot(t, phi, couleurs(k)); title('Ángulo'); xlabel('Tiempo');
+    plot(t, angulo_ref, 'c--');
+
+    % Velocidad angular del ángulo
+    subplot(3,2,4); grid on; hold on;
+    plot(t, phi_p, couleurs(k)); title('Veloc de cambio del angulo'); xlabel('Tiempo');
+end
+
+% Añadir la referencia al primer subplot
+subplot(3,2,1);
+plot(t, ref_hist, 'Color', 'c', 'DisplayName', 'ref'); legend('show');
