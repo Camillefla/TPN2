@@ -1,0 +1,209 @@
+clc; clear all; close all;
+%--------------------------------------------------------------------------
+% 1. Parámetros físicos del sistema grúa
+m  = 0.1;        % masa carga ligera (kg)
+F  = 0.1;        % coeficiente de fricción (N·s/m)
+l  = 1.6;        % longitud del cable (m)
+g  = 9.8;        % aceleración de la gravedad (m/s²)
+M  = 1.5;        % masa del carro (kg)
+m2 = m*10;       % masa carga pesada (10 veces la ligera)
+
+%--------------------------------------------------------------------------
+% 2. Matriz de estados para sistema sin carga (grúa se va)
+% Variables de estado:
+% delta: posición del carro
+% delta_p: velocidad del carro
+% phi: ángulo del péndulo
+% phi_p: velocidad angular del péndulo
+A = [0      1               0          0;
+     0    -F/M            -m*g/M       0;
+     0       0               0         1;
+     0   -F/(l*M)     -g*(m+M)/(l*M)   0];
+eig(A) % Verificar estabilidad del sistema
+
+%--------------------------------------------------------------------------
+% 3. Matriz de estados para sistema con carga (grúa regresa)
+A2 = [0      1             0          0;
+      0    -F/M         -m2*g/M       0;
+      0       0             0         1;
+      0   -F/(l*M)  -g*(m2+M)/(l*M)   0];
+
+%--------------------------------------------------------------------------
+% 4. Matrices de entrada y salida
+B = [0; 1/M; 0; 1/(l*M)]; % Entrada: fuerza aplicada al carro
+C = [1 0 0 0;              % Salida 1: posición delta
+     0 0 1 0];             % Salida 2: ángulo phi
+
+%--------------------------------------------------------------------------
+% 5. Parámetros de simulación
+h = 1e-2;   % Paso de integración (segundos)
+TT = 15;    % Tiempo total de simulación (segundos)
+
+%--------------------------------------------------------------------------
+% 6. Comprobación de controlabilidad para ambos sistemas
+M1 = [B A*B A^2*B A^3*B];
+M2 = [B A2*B A2^2*B A2^3*B];
+rank_M1 = rank(M1); % Debe ser 4 para ser controlable
+rank_M2 = rank(M2);
+
+%--------------------------------------------------------------------------
+% 7. Ampliación de matrices para control integral
+Aa = [A zeros(4,1); -C(1,:) eye(1)];   % Matriz A ampliada (estado + integral error)
+Ba = [B; 0];                      % Matriz B ampliada
+Aa2 = [A2 zeros(4,1); -C(1,:) eye(1)]; % Matriz A ampliada para sistema con carga
+
+%--------------------------------------------------------------------------
+% 8. Diseño del controlador LQR para sistema sin carga
+Q = diag([100000 100 100000000 1 1]); % Posicion-velocidad-angulo-omega-error 
+R = 800;                    % Peso para la acción de control
+
+[KLQR, S, P] = lqr(Aa, Ba, Q, R); % Cálculo de ganancias óptimas
+K = KLQR(1:4);                    % Ganancias para estados
+Ki = -KLQR(5);                   % Ganancia integral
+
+%--------------------------------------------------------------------------
+% 9. Diseño del controlador LQR para sistema con carga
+Q2 = diag([1000 1000 5000000 100 1]);
+R2 = 1000;
+
+[KLQR2, S2, P2] = lqr(Aa2, Ba, Q2, R2);
+K2 = KLQR2(1:4);
+Ki2 = -KLQR2(5);
+
+%--------------------------------------------------------------------------
+% 8. Diseño del observador (sistema dual)
+Ao = A';
+Bo = C';
+Co = B';
+
+Qo = diag([1 1 100 1]);
+Ro = diag([500 500]);
+
+Ko = lqr(Ao, Bo, Qo, Ro)';
+
+Ao2 = A2';
+Qo2 = diag([1e4 1 1e4 1]);
+Ro2 = diag([500 500]);
+Ko2 = lqr(Ao2, Bo, Qo2, Ro2)';
+
+%--------------------------------------------------------------------------
+% 9. Inicialización variables de simulación
+np = TT/h;
+zona_muerta = 0.5; % zona muerta actuador
+epsilon = 0;
+
+t = 0:h:TT;
+u = zeros(1, np+1);
+delta_p = zeros(1, np+1);
+delta = zeros(1, np+1);
+phi_p = zeros(1, np+1);
+phi = zeros(1, np+1);
+
+% Condiciones iniciales
+delta(1) = 0;
+delta_p(1) = 0;
+phi(1) = pi; % posición inicial (equilibrio estable)
+phi_p(1) = 0;
+
+x = [delta(1) delta_p(1) phi(1) phi_p(1)]';
+xop = [0 0 pi 0]';
+
+x_obs = [0 0 pi 0]';
+
+ref_hist = 10*ones(1, np+1);
+ref = 10;
+angulo_ref = pi*ones(1, np+1);
+
+%--------------------------------------------------------------------------
+% 10. Bucle de simulación
+for i = 1:np
+    y = C*x;
+    y_obs = C*(x_obs + xop);
+    
+    % Error integral
+    epsilon_p = ref - y(1);
+    epsilon = epsilon + epsilon_p*h;
+    
+    % Ley de control con observador
+    u(i) = -K*(x_obs - xop) + Ki*epsilon;
+    
+    % No linealidad del actuador (zona muerta comentada)
+    % if abs(u(i)) < zona_muerta
+    %     u(i) = 0;
+    % else
+    %     u(i) = sign(u(i))*(abs(u(i)) - zona_muerta);
+    % end
+    
+    % Dinámica no lineal del sistema
+    delta_p_next = (1/(M+m))*(u(i) - m*l*phi_p(i)*cos(phi(i)) + m*l*phi_p(i)^2*sin(phi(i)) - F*delta_p(i));
+    phi_p_next = (1/l)*(g*sin(phi(i)) - delta_p_next*cos(phi(i)));
+    
+    delta_p(i+1) = delta_p(i) + delta_p_next*h;
+    delta(i+1) = delta(i) + delta_p(i)*h;
+    phi_p(i+1) = phi_p(i) + phi_p_next*h;
+    phi(i+1) = phi(i) + phi_p(i)*h;
+    
+    % Cambio de controlador cuando la grúa regresa con carga
+    if delta(i+1) >= 10
+        K = K2;
+        Ki = Ki2;
+        Ko = Ko2;
+        A = A2;
+        m = m2;
+        ref = 0;
+    end
+    
+    if ref == 0
+        ref_hist(i+1) = ref;
+    end
+    
+    % Actualización del estado
+    x = [delta(i+1) delta_p(i+1) phi(i+1) phi_p(i+1)]';
+    
+    % Actualización del observador
+    x_obs_p = A*(x_obs - xop) + B*u(i) + Ko*(y - y_obs);
+    x_obs = x_obs + h*x_obs_p;
+end
+
+%--------------------------------------------------------------------------
+% 11. Graficación de resultados
+figure(1);
+
+% Posición del carro
+subplot(3,2,1);
+plot(t, delta);
+title('Posición grúa');
+xlabel('Tiempo');
+hold on;
+plot(t, ref_hist);
+grid on;
+
+% Velocidad del carro
+subplot(3,2,3);
+plot(t, delta_p);
+title('Velocidad de la grúa');
+xlabel('Tiempo');
+grid on;
+
+% Acción de control
+subplot(3,2,5);
+plot(t, u);
+title('Acción de control');
+xlabel('Tiempo [Seg]');
+grid on;
+
+% Ángulo del péndulo
+subplot(3,2,2);
+plot(t, phi);
+title('Ángulo');
+xlabel('Tiempo');
+hold on;
+plot(t, angulo_ref);
+grid on;
+
+% Velocidad angular del ángulo
+subplot(3,2,4);
+plot(t, phi_p);
+title('Velocidad angular del ángulo');
+xlabel('Tiempo');
+grid on;
